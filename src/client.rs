@@ -1,5 +1,4 @@
 use std::net::TcpStream;
-use std::env;
 use std::io::Write;
 use std::io::Read;
 use std::io::ErrorKind;
@@ -11,12 +10,35 @@ use std::sync::mpsc::{
     Receiver,
 };
 
+const FLAGS_LEN: usize = 1;
+const AUTHOR_SIGNATURE_LEN: usize = 4;
+const CONTENT_LENGTH_LEN: usize = 4;
+const HEADER_LEN: usize = 9;
 const TEXT_FLAG:  u8 = 0b00000001;
 const IMAGE_FLAG: u8 = 0b00000010;
 
+struct Headers {
+    flags:  u8,
+    author: Vec<u8>,
+    length: Vec<u8>,
+}
+
+impl Headers {
+    pub fn from_bytes(bytes: [u8; HEADER_LEN]) -> Self {
+        let flags = bytes[0];
+        let author = bytes[FLAGS_LEN..(FLAGS_LEN+AUTHOR_SIGNATURE_LEN)].to_vec();
+        let length = bytes[(FLAGS_LEN+AUTHOR_SIGNATURE_LEN)..].to_vec();
+        Headers {
+            flags,
+            author,
+            length,
+        }
+    }
+}
+
 struct SignedData {
-    message: Vec<u8>,
     author: String,
+    message: Vec<u8>,
 }
 
 enum Message {
@@ -26,21 +48,45 @@ enum Message {
 }
 
 fn network_thread(mut stream: TcpStream, receiver: Receiver<Message>, sender: Sender<Message>) {
-    let mut message_buf = [0; 5];
+    let mut message_buf = [0; 128];
+    let mut header_peek_buf = [0; HEADER_LEN];
     loop {
         // read the flags
-        let num_bytes_read = match stream.read(&mut message_buf) {
+        // peek the headers
+        let peek_bytes_read = match stream.peek(&mut header_peek_buf) {
             Ok(n) => n,
             Err(_) => 0,
         };
 
-        if num_bytes_read > 0 {
-            match message_buf[0] {
+        if peek_bytes_read == HEADER_LEN {// if we received a full header, we can process
+            // we can actually consume the header into header_peek_buf to clear header data from
+            // queue
+            let _ = stream.read_exact(&mut header_peek_buf).map_err(|err| {
+                println!("Could not read headers off the stream {}", err);
+            });
+            // we should parse the headers here instead of while doing the message parsing
+            let headers = Headers::from_bytes(header_peek_buf);
+            let author = match String::from_utf8(headers.author) {
+                Ok(author) => author,
+                Err(err) => { 
+                    println!("Error reading author from headers {}", err);
+                    String::default()
+                },
+            };
+            let content_len: [u8; 8] = match headers.length[0..size_of::<usize>()].try_into() {
+                Ok(val) => val,
+                Err(err) => {
+                    println!("Error parsing content length from header {}", err);
+                    [0; 8]
+                },
+            };
+            let content_len: usize = usize::from_le_bytes(content_len);
+            match headers.flags {
                 TEXT_FLAG => {
                     // collect all the input into a String
-                    let mut full_message: Vec<u8> = message_buf[0..num_bytes_read].to_vec();
+                    let mut full_message: Vec<u8> = vec![];
                     loop {
-                       match stream.read(&mut message_buf) {
+                        match stream.read(&mut message_buf) {
                             Ok(n) =>  {
                                 if n == 0 {
                                     break;
@@ -63,12 +109,18 @@ fn network_thread(mut stream: TcpStream, receiver: Receiver<Message>, sender: Se
                     }
                     match String::from_utf8(full_message[1..].to_vec()) {
                         Ok(msg) => {
-                            let message: Vec<String> = msg.split(':').map(|s| s.to_string()).collect();
-                            println!("Sending message to io handler {:?}", message);
+                            let author = match String::from_utf8(header_peek_buf[FLAGS_LEN..AUTHOR_SIGNATURE_LEN].to_vec()) {
+                                Ok(a) => a,
+                                Err(err) => {
+                                    println!("Failed to read author signature from headers {}", err);
+                                    String::default()
+                                }
+                            };
+
                             let _ = sender.send(Message::Text(
                                 SignedData {
-                                    message: message[1].as_bytes().to_vec(),
-                                    author: message[0].clone(),
+                                    author,
+                                    message: msg.as_bytes().to_vec(),
                                 }
                             ));
                         },
@@ -79,27 +131,94 @@ fn network_thread(mut stream: TcpStream, receiver: Receiver<Message>, sender: Se
                 },
                 IMAGE_FLAG => {
                     println!("We are reveicing an image! {}", message_buf[0]);
+                    // collect all the input into a String
+                    let mut full_message: Vec<u8> = vec![];
+                    loop {
+                        match stream.read(&mut message_buf) {
+                            Ok(n) =>  {
+                                if n == 0 {
+                                    break;
+                                }
+                                full_message.append(&mut message_buf[0..n].to_vec());
+                            },
+                            Err(err) => {
+                                match err.kind() {
+                                    ErrorKind::Interrupted => {},
+                                    ErrorKind::WouldBlock => {
+                                        break;
+                                    },
+                                    _ => {
+                                        println!("encountered error while reading from stream of kind {} {}", err.kind(), err);
+                                        break;
+                                    },
+                                }
+                            }
+                        };
+                    }
+                    // now we should have an image file in full_message
+                    // we want to use the image crate to take a look at it and maybe save it
+                    // we want to grab the author id from somewhere before slurping the whole image
+                    let author: String = match String::from_utf8(full_message[0..AUTHOR_SIGNATURE_LEN].to_vec()) {
+                        Ok(author_name) => author_name,
+                        Err(err) => {
+                            println!("ERROR: author name could not be read while receiving image: {}", err);
+                            String::default()
+                        }
+                    };
+
+                    let _ = sender.send(Message::Image(
+                        SignedData{
+                            author,
+                            message: full_message[AUTHOR_SIGNATURE_LEN..].to_vec(),
+                        }
+                    ));
+
                 },
                 _ => {
                     println!("We are receiving garbage... {}", message_buf[0]);
                 },
             };
+        } else {
+            println!("could not receive full header, ignoring message");
         }
         match receiver.try_recv() {
             Ok(msg) => {
                 match msg {
                     Message::Text(data) => {
                         let message = String::from_utf8(data.message).unwrap();
-                        let formatted_msg = format!("{}: {}", data.author, message);
+                        let formatted_msg = format!("{}: {}", data.author, message.trim_end());
                         println!("{}", formatted_msg);
                         if data.author == "self".to_string() {
                             // we also need to send it
-                            let formatted_msg = format!("{}: {}", stream.local_addr().unwrap().port(), message);
+                            let author_signature = format!("{}", stream.local_addr().expect("could not get local port").port() % 10000); // construct 4 byte author signature from port
+                            let formatted_msg = format!("{} {}", author_signature, message);
                             let res = stream.write_all(&[&[TEXT_FLAG], formatted_msg.as_bytes()].concat());
-                            // println!("{:?}", res);
                         }
                     },
-                    Message::Image(_data) => {
+                    Message::Image(data) => {
+                        match data.author.as_str() {
+                            "self" => {
+                                let author_signature = format!("{} ", stream.local_addr().expect("could not get local port").port() % 10000); // construct 4 byte author signature from port
+                                let message_headers = &[&[IMAGE_FLAG], author_signature.as_bytes()].concat();
+                                let message_body = &*data.message;
+                                // write_all splits things up into multiple messages :(
+                                // break the message up into chunks and send one at a time
+                                let res = stream.write_all(&[message_headers, message_body].concat());
+                                // let _ = stream.write_all();
+                            },
+                            _ => {
+                                println!("{} sent an image", data.author);
+                                let img = image::load_from_memory(&data.message);
+                                match img {
+                                    Ok(img) => {
+                                        println!("We have received VALID image bytes! {:?}", img);
+                                    },
+                                    Err(err) => {
+                                        println!("We have received INVALID image bytes! {}", err);
+                                    },
+                                }
+                            }
+                        }
                     },
                     Message::Quit => {
                         break;
@@ -119,12 +238,30 @@ fn user_thread(messages: Sender<Message>) {
             let _ = messages.send(Message::Quit);
             break;
         }
-        let _ = messages.send(Message::Text(
-            SignedData {
-                message: user_input_buf.as_bytes().to_vec(), 
-                author: "self".to_string(),
-            }
-        ));
+        if user_input_buf.starts_with("\\image: ") {
+            println!("Sending image: {}", user_input_buf);
+            // match image::open(user_input_buf[8..].to_string()) {
+            match image::open("/home/shnk/Projects/chatter/pep_but.png".to_string()) {
+                Ok(img) => {
+                    let _ = messages.send(Message::Image(
+                        SignedData {
+                            author: "self".to_string(),
+                            message: img.as_bytes().to_vec(),
+                        }
+                    ));
+                },
+                Err(err) => {
+                    println!("ERROR: could not read file from path {} {}", user_input_buf[8..].to_string(), err);
+                },
+            };
+        } else {
+            let _ = messages.send(Message::Text(
+                SignedData {
+                    message: user_input_buf.as_bytes().to_vec(), 
+                    author: "self".to_string(),
+                }
+            ));
+        }
     }
 }
 
